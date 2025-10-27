@@ -1,4 +1,4 @@
-import re, time
+import re, time, sys, logging
 from datetime import datetime
 from urllib.parse import urljoin, urlparse, urlunparse, urlencode, urlsplit, urlunsplit
 import requests
@@ -9,6 +9,9 @@ CLUB_URL = "https://www.fcf.cat/club/2526/mollet-ue-cf/2fab"
 
 DATE_RE = re.compile(r"\b(\d{2})-(\d{2})-(\d{4})\s+(\d{2}):(\d{2})\b")
 
+# -------------------------
+# SESIÓN
+# -------------------------
 def make_session():
     s = requests.Session()
     s.headers.update({
@@ -22,13 +25,15 @@ def make_session():
 
 SESSION = make_session()
 
+# -------------------------
+# HELPERS
+# -------------------------
 def soup_of(url):
     r = SESSION.get(url, timeout=25, allow_redirects=True)
     r.raise_for_status()
     return BeautifulSoup(r.text, "html.parser"), r.url, r.text
 
 def with_lang(url, lang):
-    """Añade o cambia ?lang=es|ca en la URL."""
     u = urlsplit(url)
     q = {} if not u.query else dict(x.split("=",1) for x in u.query.split("&") if "=" in x)
     q["lang"] = lang
@@ -38,11 +43,17 @@ def canonical_club_url(url):
     parts = list(urlparse(url))
     segs = [s for s in parts[2].split("/") if s]
     if len(segs) >= 3 and segs[0] == "club":
-        segs[-1] = "pi14"   # temporada “normalizada”
+        segs[-1] = "pi14"
         parts[2] = "/" + "/".join(segs)
         return urlunparse(parts)
     return url
 
+def normalize_whitespace(s):
+    return " ".join((s or "").split())
+
+# -------------------------
+# PARSEO DE EQUIPOS
+# -------------------------
 def list_teams(club_url):
     soup, final_url, _ = soup_of(club_url)
     links = soup.select('a[href^="/equip/"], a[href*="https://www.fcf.cat/equip/"]')
@@ -64,140 +75,147 @@ def list_teams(club_url):
                 if "/equip/" in href and name:
                     teams.append({"nombre": name, "url": urljoin(BASE, href)})
 
-    # dedup
     seen, out = set(), []
     for t in teams:
-        if t["url"] in seen:
-            continue
-        seen.add(t["url"])
-        out.append(t)
+        if t["url"] not in seen:
+            seen.add(t["url"])
+            out.append(t)
     return out
 
-def parse_dt(text):
-    m = DATE_RE.search(text)
-    if not m: return None
-    d, mth, y, H, M = map(int, m.groups())
-    return datetime(y, mth, d, H, M)
+# -------------------------
+# PARSEO DE PARTIDOS
+# -------------------------
+def extract_next_from_team_page(html):
+    soup = BeautifulSoup(html, "html.parser")
+    rows = soup.select("table.table_resultats tr.linia")
+    candidatos = []
 
-def next_match_from_team(team_url, team_name):
-    """
-    Recorre el DOM linealmente (soup.descendants). Cuando ve una fecha, busca:
-    - el último <a href="/equip/..."> visto antes -> 'local'
-    - el primer <a href="/equip/..."> visto después -> 'visitante'
-    """
-    def scan(url):
-        soup, _, _ = soup_of(url)
-        descendants = list(soup.descendants)
-        last_team_before = None
-        candidatos = []
+    for tr in rows:
+        team_cells = tr.select("td.resultats-w-equip")
+        if len(team_cells) != 2:
+            continue
+        local = normalize_whitespace(team_cells[0].get_text())
+        visitante = normalize_whitespace(team_cells[1].get_text())
 
-        # índice rápido para anchors con /equip/
-        equip_positions = []
-        for i, node in enumerate(descendants):
-            if getattr(node, "name", None) == "a":
-                href = node.get("href") or ""
-                if "/equip/" in href:
-                    equip_positions.append((i, node))
-
-        # barrido: memoriza el último equipo visto; cuando aparece fecha, toma el siguiente equipo
-        curr_last_team = None
-        for i, node in enumerate(descendants):
-            if getattr(node, "name", None) == "a":
-                href = node.get("href") or ""
-                if "/equip/" in href:
-                    curr_last_team = node
-
-            # fechas pueden ir como texto suelto o dentro de <a> / <span>
-            text = None
-            if isinstance(node, str):
-                text = node
-            elif getattr(node, "name", None) in ("a","span","p","div"):
-                # texto directo del tag
-                text = node.get_text(" ", strip=True)
-            if not text:
-                continue
-
-            dt = parse_dt(text)
-            if not dt:
-                continue
-
-            # tenemos fecha -> buscar el "siguiente equipo" a partir de i
-            right_team = None
-            for j, a in equip_positions:
-                if j > i:
-                    right_team = a
-                    break
-
-            left_team = curr_last_team  # último equipo visto
-
-            if left_team is None or right_team is None:
-                continue
-
-            left_name = " ".join(left_team.get_text(strip=True).split())
-            right_name = " ".join(right_team.get_text(strip=True).split())
-
-            # filtra por equipo participante (normalizado)
-            def norm(x): return re.sub(r"[\W_]+", "", (x or "")).lower()
-            ref = norm(team_name)
-            if ref not in (norm(left_name), norm(right_name)):
-                # intenta con el título de la página como referencia
-                h = soup.find(["h1","h2"])
-                page_team = h.get_text(strip=True) if h else team_name
-                if norm(page_team) not in (norm(left_name), norm(right_name)):
-                    continue
-
-            candidatos.append({
-                "dt": dt,
-                "local": left_name,
-                "visitante": right_name
-            })
-
-        return candidatos
-
-    # intenta tal cual, luego con ?lang=es y ?lang=ca
-    all_cands = []
-    for u in (team_url, with_lang(team_url, "es"), with_lang(team_url, "ca")):
-        try:
-            all_cands.extend(scan(u))
-            if all_cands:
-                break
-        except requests.RequestException:
+        mid = tr.select_one("td.resultats-w-resultat")
+        if not mid:
             continue
 
-    if not all_cands:
+        date_div = mid.select_one("div.bg-grey")
+        if date_div:
+            date_node = mid.select_one("div.bg-grey.lh-data") or date_div
+            date_text = normalize_whitespace(date_node.get_text())
+            grey_divs = mid.select("div.bg-grey")
+            time_text = ""
+            if len(grey_divs) >= 2:
+                time_text = normalize_whitespace(grey_divs[1].get_text())
+            if not time_text:
+                m = re.search(r"\b(\d{1,2}):(\d{2})\b", mid.get_text(" ", strip=True))
+                time_text = m.group(0) if m else "00:00"
+
+            try:
+                dt = datetime.strptime(f"{date_text} {time_text}", "%d-%m-%Y %H:%M")
+                candidatos.append((dt, local, visitante))
+            except ValueError:
+                continue
+
+    if not candidatos:
         return None
 
     now = datetime.now()
-    futuros = [c for c in all_cands if c["dt"] >= now]
-    chosen = min(futuros, key=lambda c: c["dt"]) if futuros else min(all_cands, key=lambda c: abs((c["dt"]-now).total_seconds()))
+    futuros = [c for c in candidatos if c[0] >= now]
+    elegido = min(futuros, key=lambda x: x[0]) if futuros else min(candidatos, key=lambda x: abs((x[0]-now).total_seconds()))
 
     return {
-        "equipo": team_name,
-        "fecha_hora": chosen["dt"].strftime("%Y-%m-%d %H:%M"),
-        "local": chosen["local"],
-        "visitante": chosen["visitante"],
-        "url_equipo": team_url,
+        "fecha_hora": elegido[0].strftime("%Y-%m-%d %H:%M"),
+        "local": elegido[1],
+        "visitante": elegido[2],
     }
 
+def next_match_from_team(team_url, team_name):
+    for u in (team_url, with_lang(team_url, "es"), with_lang(team_url, "ca")):
+        try:
+            soup, final_url, text = soup_of(u)
+            data = extract_next_from_team_page(text)
+            if not data:
+                continue
+            return {
+                "equipo": team_name,
+                "fecha_hora": data["fecha_hora"],
+                "local": data["local"],
+                "visitante": data["visitante"],
+                "url_equipo": final_url,
+            }
+        except requests.RequestException:
+            continue
+    return None
+
+# -------------------------
+# LOGGING + SALIDA BONITA
+# -------------------------
+def setup_logging(verbose=True):
+    level = logging.INFO if verbose else logging.WARNING
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)-7s | %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stdout,
+    )
+
+def print_table(rows):
+    if not rows:
+        print("No hay partidos que mostrar.")
+        return
+    headers = ["Fecha/Hora", "Local", "Visitante", "Equipo", "URL equipo"]
+    cols = list(zip(*(
+        [r["fecha_hora"], r["local"], r["visitante"], r["equipo"], r["url_equipo"]]
+        for r in rows
+    )))
+    widths = [max(len(h), max(len(x) for x in col)) for h, col in zip(headers, cols)]
+    line = " | ".join(h.ljust(w) for h, w in zip(headers, widths))
+    sep  = "-+-".join("-"*w for w in widths)
+    print(line)
+    print(sep)
+    for r in rows:
+        vals = [r["fecha_hora"], r["local"], r["visitante"], r["equipo"], r["url_equipo"]]
+        print(" | ".join(v.ljust(w) for v, w in zip(vals, widths)))
+
+# -------------------------
+# MAIN
+# -------------------------
 def main():
-    equipos = list_teams(CLUB_URL)
-    print(f"Equipos detectados: {len(equipos)}")
+    setup_logging(verbose=True)
+    logging.info(f"Descargando equipos del club: {CLUB_URL}")
+    try:
+        equipos = list_teams(CLUB_URL)
+    except Exception as e:
+        logging.exception("Fallo al listar equipos")
+        return
 
-    # mientras depuramos, limita para ir viendo resultados rápido
-    equipos = equipos[:12]
-
+    logging.info("Equipos detectados: %d", len(equipos))
+    # equipos = equipos[:12]
     resultados = []
-    for e in equipos:
-        time.sleep(0.7)  # evita rate limiting
-        nxt = next_match_from_team(e["url"], e["nombre"])
+
+    for idx, e in enumerate(equipos, 1):
+        logging.info("[%d/%d] Buscando próximo partido de: %s", idx, len(equipos), e["nombre"])
+        try:
+            time.sleep(0.7)
+            nxt = next_match_from_team(e["url"], e["nombre"])
+        except Exception as ex:
+            logging.exception("Error con el equipo %s (%s)", e["nombre"], e["url"])
+            continue
+
         if nxt:
+            logging.info("  ✔ %s vs %s @ %s", nxt["local"], nxt["visitante"], nxt["fecha_hora"])
             resultados.append(nxt)
         else:
-            print("SIN PARTIDOS:", e["nombre"], e["url"])  # debug útil
+            logging.warning("  ✖ SIN PARTIDOS: %s (%s)", e["nombre"], e["url"])
 
     resultados.sort(key=lambda x: x["fecha_hora"])
-    from pprint import pprint
-    pprint(resultados)
+    print()
+    print_table(resultados)
+    print()
+    print(f"Partidos encontrados: {len(resultados)} / Equipos procesados: {len(equipos)}", flush=True)
 
 if __name__ == "__main__":
     main()
