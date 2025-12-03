@@ -5,7 +5,7 @@ export async function getScrapedMatches(/* request: NextRequest */) {
   try {
     const res = await fetch('http://localhost:8000/fcf/scrape');
     const data = await res.json();
-    console.log(data)
+    // console.log(data)
     return data;
   } catch (error) {
     console.error(error)
