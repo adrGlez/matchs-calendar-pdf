@@ -1,8 +1,9 @@
 'use client'
 
 import { getScrapedMatches } from '@/api/route'
+import Header from '@/components/header';
 import MatchesTable from '@/components/matchesTable'
-import { Suspense, useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 
 export interface Match {
   equipo: string;
@@ -19,7 +20,7 @@ export default function Page() {
     const runScraping = async () => {
       try {
         setIsLoading(true)
-        const data = await getScrapedMatches()
+        const data = await getScrapedMatches('2025-12-20', '2025-12-21')
         setMatches(data)
 
       } catch (e: any) {
@@ -62,6 +63,6 @@ export default function Page() {
   }
 
   return (
-      <MatchesTable matches={matches} />
+    <MatchesTable matches={matches} />
   )
 }
